@@ -1,234 +1,206 @@
-#!/usr/bin/env python3
-"""
-s05_skill_loading.py: Implementation of On-Demand Knowledge Retrieval.
-
-Motto: "Load knowledge when you need it, not upfront"
-
-This module introduces a 'Meta-Tooling' approach to solve the "Context Window 
-Bloat" problem. Instead of stuffing every possible instruction, guideline, 
-or specialized SOP (Standard Operating Procedure) into the System Prompt, 
-this script allows the agent to 'discover' and 'load' specific skills 
-as needed.
-
-Key Architectural Concepts:
-    1. Discovery: The agent is given a lightweight index of available skills 
-       (Names and 1-line descriptions) in its system prompt.
-    2. Lazy Loading: The full documentation for a skill is only injected 
-       into the conversation when the agent explicitly calls `load_skill`.
-    3. Context Efficiency: This allows the agent to have access to hundreds 
-       of specialized skills without exceeding token limits or confusing the 
-       model with irrelevant data.
-
-Skill Structure:
-    Skills are stored in: skills/<skill_name>/SKILL.md
-"""
-
-# === Standard Library Imports ===
-import os      # Operating system interfaces
-import sys     # System-specific parameters and functions
-from pathlib import Path  # Object-oriented filesystem paths
-from typing import List, Dict, Any, Union, Optional  # For strict type hinting
-
-# === Local Module Imports ===
-from core import (
-    EXTENDED_TOOLS,      # Standard file/shell tools (bash, read, etc.)
-    EXTENDED_DISPATCH,   # Mapping for standard tools
-    stream_loop          # The core autonomous loop logic
-)
-
-# === Configuration and Constants ===
-
-# Define the absolute path to the 'skills' repository directory.
-# This assumes the directory structure: project_root/skills/
-SKILLS_DIR: Path = Path(__file__).parent.parent / "skills"
-
-# === Skill Discovery Logic ===
-
-def discover_skills() -> Dict[str, str]:
-    """
-    Scans the skills directory and extracts metadata from SKILL.md files.
-
-    It parses the first non-empty line of text (ignoring YAML frontmatter) 
-    to use as a brief description for the agent's index.
-
-    Returns:
-        Dict[str, str]: A dictionary mapping {skill_name: short_description}.
-    """
-    skills: Dict[str, str] = {}
-    
-    # Ensure the skills directory actually exists to avoid iteration errors
-    if not SKILLS_DIR.exists():
-        return skills
-
-    # Iterate through subdirectories in alphabetical order
-    for skill_dir in sorted(SKILLS_DIR.iterdir()):
-        skill_md = skill_dir / "SKILL.md"
-        
-        # We only consider directories that contain a SKILL.md file
-        if skill_dir.is_dir() and skill_md.exists():
-            try:
-                # Read file and split into lines for parsing
-                lines = skill_md.read_text(encoding="utf-8").splitlines()
-                description = "No description available."
-                in_frontmatter = False
-                
-                # Logic to find the first relevant line of descriptive text
-                for line in lines:
-                    stripped = line.strip()
-                    # Toggle frontmatter state (skipping YAML headers)
-                    if stripped == "---":
-                        in_frontmatter = not in_frontmatter
-                        continue
-                    
-                    # Ignore empty lines, headers (#), and frontmatter content
-                    if not in_frontmatter and stripped and not stripped.startswith("#"):
-                        description = stripped[:100]  # Cap length for prompt brevity
-                        break
-                
-                skills[skill_dir.name] = description
-            except Exception as e:
-                # Log error and continue to the next skill
-                skills[skill_dir.name] = f"Error reading metadata: {e}"
-                
-    return skills
-
-
-def run_list_skills() -> str:
-    """
-    Formats the list of discovered skills for the agent's tool output.
-
-    Returns:
-        str: A formatted string list of available skills.
-    """
-    skills = discover_skills()
-    if not skills:
-        return "(no skills found in skills/ directory)"
-    
-    # Format as a bulleted list for the LLM's consumption
-    return "\n".join(f"  - {name}: {desc}" for name, desc in skills.items())
-
-
-def run_load_skill(name: str) -> str:
-    """
-    Loads the full content of a specific skill file into the context.
-
-    Args:
-        name (str): The folder name of the skill to load.
-
-    Returns:
-        str: The full text content of the skill, or an error message.
-    """
-    # Sanitize and build the path to the skill file
-    skill_path = SKILLS_DIR / name / "SKILL.md"
-    
-    # Check for existence and potential directory traversal attempts
-    if not skill_path.exists():
-        return f"Error: skill '{name}' not found. Use list_skills to see valid names."
-    
-    try:
-        # Load the full documentation
-        content = skill_path.read_text(encoding="utf-8")
-        return f"=== SKILL: {name} ===\n\n{content}\n\n=== END SKILL ==="
-    except Exception as e:
-        return f"Error loading skill '{name}': {e}"
-
-
-# === Dynamic System Prompt Construction ===
-
-# 1. Discover skills at startup to populate the system prompt
-_initial_skills: Dict[str, str] = discover_skills()
-_skill_index_str: str = "\n".join(
-    f"  - {n}: {d}" for n, d in _initial_skills.items()
-) or "  (none currently installed)"
-
-# 2. Build the persona prompt with explicit instructions on skill loading
-SYSTEM: str = (
-    f"You are a coding agent at {os.getcwd()}.\n"
-    "You have access to specialized 'Skills' (domain knowledge files). "
-    "When a task requires specific knowledge (e.g., a specific framework, "
-    "API, or language), call load_skill(name) to get full instructions. "
-    "Do NOT guess or hallucinate details if a skill is available.\n\n"
-    f"Available Skills Index:\n{_skill_index_str}"
-)
-
-# === Tool Schema and Dispatch Extensions ===
-
-# Define the meta-tools used for managing knowledge
-SKILL_TOOLS: List[Dict[str, Any]] = EXTENDED_TOOLS + [
-    {
-        "name": "list_skills",
-        "description": "List all available specialized skills with their descriptions.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "load_skill",
-        "description": (
-            "Load the full instructions for a skill into your context. "
-            "Use this before starting a task requiring specialized domain knowledge."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string", 
-                    "description": "The exact name of the skill folder to load."
-                }
-            },
-            "required": ["name"],
-        },
-    },
-]
-
-# Map the meta-tools to their execution logic
-SKILL_DISPATCH: Dict[str, Any] = {
-    **EXTENDED_DISPATCH, # Inherit bash, read, write, etc.
-    "list_skills": lambda inp: run_list_skills(),
-    "load_skill":  lambda inp: run_load_skill(inp["name"]),
-}
-
-
-# === Main Execution Block ===
-
-def main() -> None:
-    """
-    Initializes the terminal interaction for the s05 'Skill Loading' agent.
-    """
-    # Header display in Gray
-    print("\033[90ms05: on-demand skill loading | list_skills · load_skill\033[0m\n")
-    
-    # Session interaction history
-    history: List[Dict[str, Any]] = []
-
-    # Main REPL loop
-    while True:
-        try:
-            # User Input in Cyan
-            query: str = input("\033[36ms05 >> \033[0m").strip()
-        except (EOFError, KeyboardInterrupt):
-            # Graceful exit
-            print("\nExiting session.")
-            sys.exit(0)
-
-        # Standard exit handlers
-        if not query or query.lower() in ("q", "exit", "quit"):
-            break
-
-        # Record user query
-        history.append({"role": "user", "content": query})
-        
-        # Execute the agentic loop with dynamic skill loading capabilities
-        # and the custom system prompt containing the skill index.
-        stream_loop(
-            messages=history,
-            tools=SKILL_TOOLS,
-            dispatch=SKILL_DISPATCH,
-            system=SYSTEM
-        )
-        
-        # Visual spacer for next turn
-        print()
-
-
-if __name__ == "__main__":
-    # Script entry point
-    main()
+   1	#!/usr/bin/env python3
+   2	"""
+   3	s05_skill_loading.py: Implementation of On-Demand Knowledge Retrieval.
+   4	
+   5	Motto: "Load knowledge when you need it, not upfront"
+   6	
+   7	This module introduces a 'Meta-Tooling' approach to solve the "Context Window 
+   8	Bloat" problem. Instead of stuffing every possible instruction, guideline, 
+   9	or specialized SOP (Standard Operating Procedure) into the System Prompt, 
+  10	this script allows the agent to 'discover' and 'load' specific skills 
+  11	as needed.
+  12	
+  13	Key Architectural Concepts:
+  14	    1. Discovery: The agent is given a lightweight index of available skills 
+  15	       (Names and 1-line descriptions) in its system prompt.
+  16	    2. Lazy Loading: The full documentation for a skill is only injected 
+  17	       into the conversation when the agent explicitly calls `load_skill`.
+  18	    3. Context Efficiency: This allows the agent to have access to hundreds 
+  19	       of specialized skills without exceeding token limits or confusing the 
+  20	       model with irrelevant data.
+  21	
+  22	Skill Structure:
+  23	    Skills are stored in: skills/<skill_name>/SKILL.md
+  24	"""
+  25	
+  26	# === Standard Library Imports ===
+  27	import os      # Operating system interfaces
+  28	import sys     # System-specific parameters and functions
+  29	from pathlib import Path  # Object-oriented filesystem paths
+  30	from typing import List, Dict, Any, Union, Optional  # For strict type hinting
+  31	
+  32	# === Local Module Imports ===
+  33	from core import (
+  34	    EXTENDED_TOOLS,      # Standard file/shell tools (bash, read, etc.)
+  35	    EXTENDED_DISPATCH,   # Mapping for standard tools
+  36	    stream_loop          # The core autonomous loop logic
+  37	)
+  38	
+  39	# === Configuration and Constants ===
+  40	
+  41	# Define the absolute path to the 'skills' repository directory.
+  42	# This assumes the directory structure: project_root/skills/
+  43	SKILLS_DIR: Path = Path(__file__).parent / "skills"
+  44	
+  45	# === Skill Discovery Logic ===
+  46	
+  47	def discover_skills() -> Dict[str, str]:
+  48	    """
+  49	    Scans the skills directory and extracts metadata from SKILL.md files.
+  50	
+  51	    It parses the first non-empty line of text (ignoring YAML frontmatter) 
+  52	    to use as a brief description for the agent's index.
+  53	
+  54	    Returns:
+  55	        Dict[str, str]: A dictionary mapping {skill_name: short_description}.
+  56	    """
+  57	    skills: Dict[str, str] = {}
+  58	    
+  59	    if not SKILLS_DIR.exists():
+  60	        return skills
+  61	
+  62	    for skill_dir in sorted(SKILLS_DIR.iterdir()):
+  63	        skill_md = skill_dir / "SKILL.md"
+  64	        
+  65	        if skill_dir.is_dir() and skill_md.exists():
+  66	            try:
+  67	                lines = skill_md.read_text(encoding="utf-8").splitlines()
+  68	                description = "No description available."
+  69	                in_frontmatter = False
+  70	                
+  71	                for line in lines:
+  72	                    stripped = line.strip()
+  73	                    if stripped == "---":
+  74	                        in_frontmatter = not in_frontmatter
+  75	                        continue
+  76	                    if in_frontmatter and stripped.startswith("description:"):
+  77	                        description = stripped[len("description:"):].strip()[:80]
+  78	                        break
+  79	                
+  80	                skills[skill_dir.name] = description
+  81	            except Exception as e:
+  82	                skills[skill_dir.name] = f"Error reading metadata: {e}"
+  83	                
+  84	    return skills
+  85	
+  86	
+  87	def run_list_skills() -> str:
+  88	    """
+  89	    Formats the list of discovered skills for the agent's tool output.
+  90	
+  91	    Returns:
+  92	        str: A formatted string list of available skills.
+  93	    """
+  94	    skills = discover_skills()
+  95	    if not skills:
+  96	        return "(no skills found in skills/ directory)"
+  97	    
+  98	    return "\n".join(f"  - {name}: {desc}" for name, desc in skills.items())
+  99	
+ 100	
+ 101	def run_load_skill(name: str) -> str:
+ 102	    """
+ 103	    Loads the full content of a specific skill file into the context.
+ 104	
+ 105	    Args:
+ 106	        name (str): The folder name of the skill to load.
+ 107	
+ 108	    Returns:
+ 109	        str: The full text content of the skill, or an error message.
+ 110	    """
+ 111	    skill_path = SKILLS_DIR / name / "SKILL.md"
+ 112	    
+ 113	    if not skill_path.exists():
+ 114	        return f"Error: skill '{name}' not found. Use list_skills to see valid names."
+ 115	    
+ 116	    try:
+ 117	        content = skill_path.read_text(encoding="utf-8")
+ 118	        return f"=== SKILL: {name} ===\n\n{content}\n\n=== END SKILL ==="
+ 119	    except Exception as e:
+ 120	        return f"Error loading skill '{name}': {e}"
+ 121	
+ 122	
+ 123	# === Dynamic System Prompt Construction ===
+ 124	
+ 125	_initial_skills: Dict[str, str] = discover_skills()
+ 126	_skill_index_str: str = "\n".join(
+ 127	    f"  - {n}: {d}" for n, d in _initial_skills.items()
+ 128	) or "  (none currently installed)"
+ 129	
+ 130	SYSTEM: str = (
+ 131	    f"You are a coding agent at {os.getcwd()}.\n"
+ 132	    "You have access to specialized 'Skills' (domain knowledge files). "
+ 133	    "ALWAYS call load_skill(name) BEFORE starting ANY code task. "
+ 134	    "NEVER fix code without loading the relevant skill first. "
+ 135	    "Do NOT guess or hallucinate details if a skill is available.\n\n"
+ 136	    f"Available Skills Index:\n{_skill_index_str}"
+ 137	)
+ 138	
+ 139	# === Tool Schema and Dispatch Extensions ===
+ 140	
+ 141	SKILL_TOOLS: List[Dict[str, Any]] = EXTENDED_TOOLS + [
+ 142	    {
+ 143	        "name": "list_skills",
+ 144	        "description": "List all available specialized skills with their descriptions.",
+ 145	        "input_schema": {"type": "object", "properties": {}},
+ 146	    },
+ 147	    {
+ 148	        "name": "load_skill",
+ 149	        "description": (
+ 150	            "Load the full instructions for a skill into your context. "
+ 151	            "Use this before starting a task requiring specialized domain knowledge."
+ 152	        ),
+ 153	        "input_schema": {
+ 154	            "type": "object",
+ 155	            "properties": {
+ 156	                "name": {
+ 157	                    "type": "string",
+ 158	                    "description": "The exact name of the skill folder to load."
+ 159	                }
+ 160	            },
+ 161	            "required": ["name"],
+ 162	        },
+ 163	    },
+ 164	]
+ 165	
+ 166	SKILL_DISPATCH: Dict[str, Any] = {
+ 167	    **EXTENDED_DISPATCH,
+ 168	    "list_skills": lambda inp: run_list_skills(),
+ 169	    "load_skill":  lambda inp: run_load_skill(inp["name"]),
+ 170	}
+ 171	
+ 172	
+ 173	# === Main Execution Block ===
+ 174	
+ 175	def main() -> None:
+ 176	    """
+ 177	    Initializes the terminal interaction for the s05 'Skill Loading' agent.
+ 178	    """
+ 179	    print("\033[90ms05: on-demand skill loading | list_skills · load_skill\033[0m\n")
+ 180	    
+ 181	    history: List[Dict[str, Any]] = []
+ 182	
+ 183	    while True:
+ 184	        try:
+ 185	            query: str = input("\033[36ms05 >> \033[0m").strip()
+ 186	        except (EOFError, KeyboardInterrupt):
+ 187	            print("\nExiting session.")
+ 188	            sys.exit(0)
+ 189	
+ 190	        if not query or query.lower() in ("q", "exit", "quit"):
+ 191	            break
+ 192	
+ 193	        history.append({"role": "user", "content": query})
+ 194	        
+ 195	        stream_loop(
+ 196	            messages=history,
+ 197	            tools=SKILL_TOOLS,
+ 198	            dispatch=SKILL_DISPATCH,
+ 199	            system=SYSTEM
+ 200	        )
+ 201	        
+ 202	        print()
+ 203	
+ 204	
+ 205	if __name__ == "__main__":
+ 206	    main()
