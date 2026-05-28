@@ -146,3 +146,5 @@ history.append({"role": "user", "content":
 "do not guess anything. You have access to full hitory of what you did"
 
 })
+
+#making changes
